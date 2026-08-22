@@ -118,6 +118,24 @@ turns hiss into rain.
 omarchy plugin update wyatt.noisebox
 ```
 
+## Remove
+
+```bash
+omarchy plugin remove wyatt.noisebox
+```
+
+That stops the widget and deletes the plugin. Your saved slider positions and
+the optional symlink are left behind deliberately; remove them yourself if you
+want nothing left:
+
+```bash
+rm -rf ~/.config/noisebox
+rm -f ~/.local/bin/noisebox
+```
+
+Any keybindings you added to `~/.config/hypr/bindings.lua` are yours to delete —
+the plugin never edits that file.
+
 ## Validate from source
 
 ```bash
