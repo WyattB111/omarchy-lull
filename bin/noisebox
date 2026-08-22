@@ -1,0 +1,860 @@
+#!/usr/bin/env python3
+"""
+noisebox — procedural ambient noise, synthesised from nothing.
+
+There are no sample files anywhere in this program. Every sound is built out
+of shaped random numbers, which is exactly what rain, surf and wind physically
+are: broadband noise with a particular spectral tilt, moving slowly.
+
+The generator works in the frequency domain. Each 21 ms hop we draw a frame of
+complex Gaussian noise, multiply it by a target spectral envelope, inverse-FFT
+it, and overlap-add with a sqrt-Hann window (which sums to unity power at 50%
+overlap, so the seams are inaudible). Changing the envelope between frames is
+therefore an automatic crossfade — sliders can be dragged while it plays and
+nothing clicks.
+
+On top of that steady bed sit two things that make noise sound like weather:
+a slow envelope (the swell of a wave, the gust of wind) and sparse transients
+(individual rain drops, bubbles), scheduled as a Poisson process.
+
+Architecture mirrors daybook: all the thinking lives here, the QML bar plugin
+is only a view. It talks to the running daemon over a unix socket with
+newline-delimited JSON, so a slider drag is a few bytes, not a process spawn.
+"""
+
+import argparse
+import json
+import math
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import numpy as np
+
+# ----------------------------------------------------------------- constants
+
+RATE = 48000
+FRAME = 2048                 # spectral frame length
+HOP = FRAME // 2             # 1024 samples ≈ 21.3 ms
+CHANNELS = 2
+
+CONFIG_DIR = os.path.expanduser("~/.config/noisebox")
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+SOCK_PATH = os.path.join(RUNTIME_DIR, "noisebox.sock")
+
+MODE_ORDER = ["rain", "ocean", "wind", "stream", "fan", "noise"]
+
+# Calibration. BED_GAIN puts a full-volume bed near -17 dBFS; MAKEUP gives back
+# the headroom that a mode's own slow envelope spends, so switching sounds does
+# not change how loud the room is.
+BED_GAIN = 6.0
+DROP_GAIN = 0.30
+MAKEUP = {"ocean": 1.75, "wind": 1.35, "stream": 1.05}
+
+MODE_LABELS = {
+    "rain": "Rain",
+    "ocean": "Ocean",
+    "wind": "Wind",
+    "stream": "Stream",
+    "fan": "Fan",
+    "noise": "Noise",
+}
+
+# Per-mode sliders. Order here is the order the panel draws them.
+MODE_PARAMS = {
+    "rain":   [("brightness", "Brightness", 0.45),
+               ("density",    "Patter",     0.55),
+               ("heaviness",  "Downpour",   0.25)],
+    "ocean":  [("period",     "Wave length", 0.45),
+               ("surf",       "Surf",        0.55),
+               ("depth",      "Swell depth", 0.65)],
+    "wind":   [("gust",       "Gustiness",  0.45),
+               ("howl",       "Howl",       0.30),
+               ("body",       "Body",       0.50)],
+    "stream": [("brightness", "Brightness", 0.55),
+               ("bubble",     "Bubbling",   0.45),
+               ("body",       "Depth",      0.40)],
+    "fan":    [("speed",      "Speed",      0.50),
+               ("body",       "Body",       0.55)],
+    "noise":  [("colour",     "Colour",     0.50)],
+}
+
+GLOBAL_PARAMS = [("volume", "Volume", 0.45),
+                 ("muffle", "Muffle", 0.15),
+                 ("width",  "Width",  0.80)]
+
+
+def default_state():
+    st = {
+        "playing": False,
+        "mode": "rain",
+        "sleep_minutes": 0,
+        "modes": {m: {k: d for k, _, d in MODE_PARAMS[m]} for m in MODE_ORDER},
+    }
+    st.update({k: d for k, _, d in GLOBAL_PARAMS})
+    return st
+
+
+# ------------------------------------------------------------------- helpers
+
+FREQS = np.fft.rfftfreq(FRAME, 1.0 / RATE)
+FSAFE = np.maximum(FREQS, 18.0)
+
+
+# Everything gets a steep subsonic cut. Without it the -1.5 tilts used for
+# downpour rumble and brown noise dump most of their power below hearing,
+# where it only steals headroom and makes woofers flap.
+SUB = 1.0 / np.sqrt(1.0 + (30.0 / np.maximum(FREQS, 1e-9)) ** 6.0)
+SUB[FREQS < 14.0] = 0.0
+
+
+def tilt(alpha):
+    """Spectral slope: 0 white, -0.5 pink, -1 brown."""
+    return (FSAFE / 1000.0) ** alpha
+
+
+def lowpass(fc, order=1.5):
+    return 1.0 / np.sqrt(1.0 + (FSAFE / fc) ** (2.0 * order))
+
+
+def highpass(fc, order=1.5):
+    return 1.0 / np.sqrt(1.0 + (fc / FSAFE) ** (2.0 * order))
+
+
+def bump(fc, bw, gain):
+    """A resonant hump, gaussian in log-frequency. bw is in octaves-ish."""
+    return 1.0 + gain * np.exp(-0.5 * (np.log(FSAFE / fc) / bw) ** 2)
+
+
+def unit(e):
+    """Scale a spectral envelope to unit power.
+
+    Layers are summed, so unless each one is normalised first a slider labelled
+    "a bit of rumble" silently becomes the whole sound: a -1.5 tilt is ~40 dB
+    louder at 60 Hz than the bed it is meant to sit under. Normalising first
+    makes the weights mean what they say.
+    """
+    return e / (float(np.sqrt(np.mean(e * e))) or 1e-9)
+
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+
+def logmap(t, lo, hi):
+    t = min(1.0, max(0.0, float(t)))
+    return lo * (hi / lo) ** t
+
+
+def clamp01(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return min(1.0, max(0.0, v))
+
+
+# --------------------------------------------------------------- transients
+
+GRAIN_N = 4096
+GFREQ = np.fft.rfftfreq(GRAIN_N, 1.0 / RATE)
+GSAFE = np.maximum(GFREQ, 20.0)
+
+
+def make_droplet(rng, lo_hz, hi_hz, lo_dur, hi_dur, tone_bias):
+    """One rain drop or bubble.
+
+    Built the same way as the bed — noise through a spectral envelope — but
+    with a sharp resonance at f0 and a fast exponential decay, which is what a
+    drop striking a surface actually is. Making it spectrally (rather than
+    sine + white noise) keeps the top end from turning into a hiss.
+    """
+    f0 = math.exp(rng.uniform(math.log(lo_hz), math.log(hi_hz)))
+    bw = rng.uniform(0.14, 0.42) / max(0.25, tone_bias)
+    env = (GSAFE / 1000.0) ** -0.5
+    env = env * (1.0 + 16.0 * tone_bias * np.exp(-0.5 * (np.log(GSAFE / f0) / bw) ** 2))
+    env = env / np.sqrt(1.0 + (GSAFE / 8000.0) ** 4.0)        # tame the hiss
+    env = env / np.sqrt(1.0 + (200.0 / GSAFE) ** 3.0)         # no thud
+    re = rng.standard_normal(len(env))
+    im = rng.standard_normal(len(env))
+    X = (re + 1j * im) * env
+    X[0] = X[0].real
+    X[-1] = X[-1].real
+    y = np.fft.irfft(X, GRAIN_N)
+
+    dur = rng.uniform(lo_dur, hi_dur)
+    n = max(16, int(dur * RATE))
+    t = np.arange(n) / RATE
+    y = y[:n] * np.exp(-t / (dur * 0.30))
+    fade = min(n, 20)
+    y[:fade] *= np.linspace(0.0, 1.0, fade)
+    peak = float(np.abs(y).max()) or 1.0
+    return (y / peak).astype(np.float32)
+
+
+class TransientBank:
+    """A Poisson sprinkler of pre-synthesised one-shots."""
+
+    def __init__(self, rng, count=48, **kw):
+        self.grains = [make_droplet(rng, **kw) for _ in range(count)]
+        self.longest = max(len(g) for g in self.grains)
+        self.taillen = self.longest + 4
+        self.tail = np.zeros((self.taillen, CHANNELS), dtype=np.float32)
+
+    def render(self, rng, rate_hz, gain, width):
+        buf = np.zeros((HOP + self.taillen, CHANNELS), dtype=np.float32)
+        buf[:self.taillen] += self.tail
+
+        if rate_hz > 0.01 and gain > 0.0001:
+            n = rng.poisson(rate_hz * HOP / RATE)
+            for _ in range(int(n)):
+                g = self.grains[rng.integers(len(self.grains))]
+                at = int(rng.integers(0, HOP))
+                amp = gain * float(rng.uniform(0.25, 1.0)) ** 1.6
+                pan = 0.5 + width * (float(rng.random()) - 0.5)
+                seg = g * amp
+                buf[at:at + len(g), 0] += seg * math.sqrt(1.0 - pan)
+                buf[at:at + len(g), 1] += seg * math.sqrt(pan)
+
+        self.tail[:] = buf[HOP:]
+        return buf[:HOP].copy()
+
+
+# ------------------------------------------------------------------- engine
+
+class Engine:
+    """Turns the state dict into a stereo float32 stream."""
+
+    def __init__(self):
+        self.rng = np.random.default_rng()
+        n = np.arange(FRAME)
+        hann = 0.5 - 0.5 * np.cos(2.0 * math.pi * n / FRAME)   # periodic
+        self.window = np.sqrt(hann).astype(np.float64)
+        self.ola = np.zeros((FRAME, CHANNELS), dtype=np.float64)
+        self.rain = TransientBank(self.rng, 48, lo_hz=700, hi_hz=5200,
+                                  lo_dur=0.008, hi_dur=0.045, tone_bias=0.55)
+        self.bubble = TransientBank(self.rng, 40, lo_hz=1400, hi_hz=6500,
+                                    lo_dur=0.006, hi_dur=0.028, tone_bias=0.8)
+        self.gain = 0.0
+        self.scale = 0.0
+        self.t = 0.0
+        # Independent slow oscillators, deliberately incommensurate periods so
+        # the swell never repeats audibly.
+        self.phase = self.rng.uniform(0.0, 2.0 * math.pi, 4)
+
+    # -- modulation ------------------------------------------------------
+
+    def slow(self, periods):
+        """Sum of a few detuned sines, normalised to 0..1."""
+        v = 0.0
+        for i, p in enumerate(periods):
+            v += math.sin(2.0 * math.pi * self.t / p + self.phase[i])
+        return 0.5 + 0.5 * (v / len(periods))
+
+    # -- spectra ---------------------------------------------------------
+
+    def spectrum(self, mode, p, mod):
+        if mode == "rain":
+            fc = logmap(p["brightness"], 1300, 11000)
+            e = unit(tilt(-0.30) * highpass(200, 1.4) * lowpass(fc, 1.2)
+                     * bump(3200, 0.85, 0.5 * p["brightness"]))
+            if p["heaviness"] > 0.001:
+                e = e + 0.95 * p["heaviness"] * unit(
+                    tilt(-0.8) * lowpass(260, 2.5) * highpass(45, 2.0))
+            e = e * lerp(0.93, 1.07, mod)
+
+        elif mode == "ocean":
+            fc = logmap(0.2 + 0.8 * mod, 400, 3000)
+            e = unit(tilt(-0.85) * highpass(45, 1.5) * lowpass(fc, 1.3))
+            foam = p["surf"] * (mod ** 2)
+            if foam > 0.001:
+                e = e + 1.15 * foam * unit(
+                    tilt(-0.15) * highpass(800, 1.6) * lowpass(9000, 1.2))
+
+        elif mode == "wind":
+            fc = logmap(0.1 + 0.9 * mod, 150, 950)
+            bw = lerp(0.85, 0.26, p["howl"])
+            e = unit(tilt(-0.65) * bump(fc, bw, 0.4 + 3.4 * p["howl"])
+                     * lowpass(logmap(p["body"], 1600, 7000), 1.2) * highpass(60, 1.5))
+
+        elif mode == "stream":
+            e = unit(tilt(-0.25)
+                     * highpass(logmap(p["body"], 700, 150), 1.6)
+                     * lowpass(logmap(p["brightness"], 2500, 12000), 1.2)
+                     * bump(logmap(mod, 900, 2200), 0.7, 0.35))
+
+        elif mode == "fan":
+            fc = logmap(p["speed"], 55, 260)
+            e = unit(tilt(-0.7) * bump(fc, 0.42, 0.8 + 1.8 * p["body"])
+                     * lowpass(logmap(p["body"], 1200, 5000), 1.5) * highpass(40, 1.5))
+
+        else:  # noise: white -> pink -> brown
+            e = unit(tilt(-1.05 * p["colour"]) * highpass(20, 1.0))
+
+        return e
+
+    # -- one hop ---------------------------------------------------------
+
+    def render(self, st):
+        mode = st["mode"]
+        p = st["modes"][mode]
+
+        # Slow modulation, per mode.
+        if mode == "ocean":
+            base = lerp(16.0, 5.0, clamp01(p["period"]))
+            mod = self.slow([base, base * 1.37, base * 2.11])
+            depth = clamp01(p["depth"])
+            amp_env = lerp(1.0, lerp(0.18, 1.0, mod ** 1.6), depth)
+        elif mode == "wind":
+            g = clamp01(p["gust"])
+            base = lerp(11.0, 2.6, g)
+            mod = self.slow([base, base * 1.53, base * 0.71])
+            amp_env = lerp(1.0, lerp(0.28, 1.0, mod ** 1.3), 0.35 + 0.6 * g)
+        elif mode == "stream":
+            mod = self.slow([3.1, 5.7, 8.3])
+            amp_env = lerp(0.93, 1.07, mod)
+        else:
+            mod = self.slow([7.0, 11.0, 17.0])
+            amp_env = 1.0
+
+        env = self.spectrum(mode, p, mod)
+
+        env = env * SUB
+
+        muffle = clamp01(st["muffle"])
+        if muffle > 0.001:
+            env = env * lowpass(logmap(1.0 - muffle, 900, 20000), 1.6)
+
+        # Constant-power normalisation, so moving a tone slider changes the
+        # colour of the sound and not how loud it is.
+        power = float(np.sqrt(np.mean(env * env))) or 1e-9
+        env = env / power
+
+        # Two independent noise frames; `width` decides how much of the second
+        # one the right channel gets. Variance stays 1 either way.
+        frames = []
+        for _ in range(2):
+            re = self.rng.standard_normal(len(env))
+            im = self.rng.standard_normal(len(env))
+            X = (re + 1j * im) * env
+            X[0] = X[0].real
+            X[-1] = X[-1].real
+            frames.append(np.fft.irfft(X, FRAME))
+
+        w = clamp01(st["width"])
+        left = frames[0]
+        right = math.sqrt(1.0 - w) * frames[0] + math.sqrt(w) * frames[1]
+
+        block = np.empty((FRAME, CHANNELS))
+        block[:, 0] = left
+        block[:, 1] = right
+        block *= self.window[:, None]
+
+        self.ola[:-HOP] = self.ola[HOP:]
+        self.ola[-HOP:] = 0.0
+        self.ola += block
+        # Both the makeup gain and the swell envelope are per-hop scalars, and
+        # a mode switch steps the makeup by up to 5 dB. Ramp the product across
+        # the hop so switching sounds mid-playback is a fade, not a bump.
+        scale = BED_GAIN * MAKEUP.get(mode, 1.0) * amp_env
+        scale_ramp = np.linspace(self.scale, scale, HOP, endpoint=False)
+        self.scale = scale
+        out = self.ola[:HOP].copy() * scale_ramp[:, None]
+
+        # Transients.
+        if mode == "rain":
+            d = clamp01(p["density"])
+            rate = 520.0 * (d ** 2.2)
+            g = DROP_GAIN * (1.0 - 0.45 * d) * lerp(0.7, 1.2, clamp01(p["brightness"]))
+            out += self.rain.render(self.rng, rate, g, w)
+        elif mode == "stream":
+            b = clamp01(p["bubble"])
+            out += self.bubble.render(self.rng, 340.0 * (b ** 2.0),
+                                      DROP_GAIN * 0.7 * (1.0 - 0.45 * b), w)
+
+        # Master gain, ramped across the hop so nothing zips or clicks.
+        target = 0.0
+        if st["playing"]:
+            target = clamp01(st["volume"]) ** 2.0 * st.get("_fade", 1.0)
+        ramp = np.linspace(self.gain, target, HOP, endpoint=False)
+        self.gain = target
+        out *= ramp[:, None]
+
+        self.t += HOP / RATE
+        np.tanh(out, out=out)
+        return out.astype(np.float32)
+
+
+# ------------------------------------------------------------------- daemon
+
+class Daemon:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.state = self.load()
+        self.engine = Engine()
+        self.proc = None
+        self.subscribers = []
+        self.dirty = False
+        self.stop_flag = threading.Event()
+        self.sleep_until = 0.0
+        self.idle_since = time.time()
+        self._last_bcast = 0.0
+        self._pending_bcast = False
+
+    # -- persistence -----------------------------------------------------
+
+    def load(self):
+        st = default_state()
+        try:
+            with open(CONFIG_PATH) as fh:
+                saved = json.load(fh)
+        except (OSError, ValueError):
+            return st
+        for k, _, _ in GLOBAL_PARAMS:
+            if k in saved:
+                st[k] = clamp01(saved[k])
+        if saved.get("mode") in MODE_ORDER:
+            st["mode"] = saved["mode"]
+        st["sleep_minutes"] = max(0, int(saved.get("sleep_minutes", 0) or 0))
+        for m, params in st["modes"].items():
+            for k in params:
+                v = saved.get("modes", {}).get(m, {}).get(k)
+                if v is not None:
+                    params[k] = clamp01(v)
+        # Playing is deliberately not restored; a reboot should be silent.
+        return st
+
+    def save(self):
+        with self.lock:
+            snap = {k: self.state[k] for k, _, _ in GLOBAL_PARAMS}
+            snap["mode"] = self.state["mode"]
+            snap["sleep_minutes"] = self.state["sleep_minutes"]
+            snap["modes"] = json.loads(json.dumps(self.state["modes"]))
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        tmp = CONFIG_PATH + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(snap, fh, indent=2)
+        os.replace(tmp, CONFIG_PATH)
+
+    # -- public view -----------------------------------------------------
+
+    def snapshot(self):
+        with self.lock:
+            st = self.state
+            remain = 0
+            if st["playing"] and self.sleep_until:
+                remain = max(0, int(round(self.sleep_until - time.time())))
+            return {
+                "playing": st["playing"],
+                "mode": st["mode"],
+                "modeLabel": MODE_LABELS[st["mode"]],
+                "volume": st["volume"],
+                "muffle": st["muffle"],
+                "width": st["width"],
+                "sleepMinutes": st["sleep_minutes"],
+                "sleepRemaining": remain,
+                "params": dict(st["modes"][st["mode"]]),
+                "modes": json.loads(json.dumps(st["modes"])),
+                "order": MODE_ORDER,
+                "labels": MODE_LABELS,
+                "schema": {m: [{"key": k, "label": lab} for k, lab, _ in MODE_PARAMS[m]]
+                           for m in MODE_ORDER},
+            }
+
+    def broadcast(self, force=True):
+        # A slider drag is ~60 sets a second and the snapshot is a kilobyte of
+        # JSON. Subscribers only need to see the tail of a drag, so coalesce.
+        now = time.monotonic()
+        if not force and now - self._last_bcast < 0.12:
+            # Coalesce, but never drop: flush_loop sends the tail. Without the
+            # trailing send, a change made from the CLI while a panel is open
+            # leaves that panel showing a value that is no longer true.
+            self._pending_bcast = True
+            return
+        self._pending_bcast = False
+        self._last_bcast = now
+        line = (json.dumps(self.snapshot()) + "\n").encode()
+        for conn in list(self.subscribers):
+            try:
+                conn.sendall(line)
+            except OSError:
+                try:
+                    self.subscribers.remove(conn)
+                except ValueError:
+                    pass
+
+    # -- commands --------------------------------------------------------
+
+    def handle(self, msg):
+        cmd = msg.get("cmd", "")
+        with self.lock:
+            st = self.state
+            if cmd == "set":
+                for k, v in (msg.get("params") or {}).items():
+                    if k in ("volume", "muffle", "width"):
+                        st[k] = clamp01(v)
+                    elif k == "mode":
+                        if v in MODE_ORDER:
+                            st["mode"] = v
+                    elif k == "sleep":
+                        st["sleep_minutes"] = max(0, min(600, int(v or 0)))
+                        self.arm_sleep()
+                    elif k in st["modes"][st["mode"]]:
+                        st["modes"][st["mode"]][k] = clamp01(v)
+                    elif "." in k:
+                        m, key = k.split(".", 1)
+                        if m in st["modes"] and key in st["modes"][m]:
+                            st["modes"][m][key] = clamp01(v)
+                self.dirty = True
+            elif cmd in ("play", "on"):
+                st["playing"] = True
+                self.arm_sleep()
+                self.dirty = True
+            elif cmd in ("stop", "off"):
+                st["playing"] = False
+                self.dirty = True
+            elif cmd == "toggle":
+                st["playing"] = not st["playing"]
+                self.arm_sleep()
+                self.dirty = True
+            elif cmd == "mode":
+                if msg.get("name") in MODE_ORDER:
+                    st["mode"] = msg["name"]
+                    if msg.get("play"):
+                        st["playing"] = True
+                        self.arm_sleep()
+                    self.dirty = True
+            elif cmd == "nudge":
+                st["volume"] = clamp01(st["volume"] + float(msg.get("by", 0.05)))
+                self.dirty = True
+            elif cmd == "quit":
+                self.stop_flag.set()
+        self.broadcast(force=(cmd != "set"))
+        return self.snapshot()
+
+    def arm_sleep(self):
+        mins = self.state["sleep_minutes"]
+        self.sleep_until = time.time() + mins * 60 if (mins and self.state["playing"]) else 0.0
+
+    # -- audio sink ------------------------------------------------------
+
+    def open_sink(self):
+        if self.proc and self.proc.poll() is None:
+            return
+        cmd = ["pw-cat", "--playback", "--raw",
+               "--format", "f32", "--rate", str(RATE), "--channels", str(CHANNELS),
+               "--latency", "120ms", "--media-role", "Music",
+               "-P", "media.name=noisebox", "-P", "node.name=noisebox", "-"]
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            self.proc = subprocess.Popen(
+                ["paplay", "--raw", "--format=float32le", f"--rate={RATE}",
+                 f"--channels={CHANNELS}", "--stream-name=noisebox"],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+
+    def close_sink(self):
+        if not self.proc:
+            return
+        try:
+            self.proc.stdin.close()
+        except OSError:
+            pass
+        try:
+            self.proc.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        self.proc = None
+
+    # -- audio loop ------------------------------------------------------
+
+    def audio_loop(self):
+        fading = False
+        while not self.stop_flag.is_set():
+            with self.lock:
+                st = self.state
+                playing = st["playing"]
+                if self.sleep_until and playing:
+                    left = self.sleep_until - time.time()
+                    if left <= 0:
+                        st["playing"] = False
+                        self.sleep_until = 0.0
+                        playing = False
+                        self.dirty = True
+                        threading.Thread(target=self.broadcast, daemon=True).start()
+                    else:
+                        # Last 90 seconds ease down to nothing.
+                        st["_fade"] = min(1.0, max(0.0, left / 90.0)) if left < 90 else 1.0
+                else:
+                    st["_fade"] = 1.0
+                snap = {"playing": playing, "mode": st["mode"], "volume": st["volume"],
+                        "muffle": st["muffle"], "width": st["width"],
+                        "modes": st["modes"], "_fade": st.get("_fade", 1.0)}
+
+            if not playing and self.engine.gain <= 0.0000001:
+                if self.proc:
+                    self.close_sink()
+                self.idle_since = self.idle_since or time.time()
+                time.sleep(0.05)
+                continue
+
+            self.idle_since = 0.0
+            self.open_sink()
+            block = self.engine.render(snap)
+            try:
+                self.proc.stdin.write(block.tobytes())
+                self.proc.stdin.flush()
+            except (BrokenPipeError, OSError, AttributeError):
+                self.close_sink()
+                time.sleep(0.1)
+        self.close_sink()
+
+    def flush_loop(self):
+        while not self.stop_flag.wait(0.15):
+            if self._pending_bcast:
+                self.broadcast()
+
+    def save_loop(self):
+        while not self.stop_flag.wait(2.0):
+            if self.dirty:
+                self.dirty = False
+                try:
+                    self.save()
+                except OSError:
+                    pass
+
+    # -- socket ----------------------------------------------------------
+
+    def serve(self):
+        try:
+            os.unlink(SOCK_PATH)
+        except FileNotFoundError:
+            pass
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(SOCK_PATH)
+        srv.listen(16)
+        srv.settimeout(0.5)
+        while not self.stop_flag.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            threading.Thread(target=self.client, args=(conn,), daemon=True).start()
+        srv.close()
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+
+    def client(self, conn):
+        buf = b""
+        subscribed = False
+        try:
+            conn.settimeout(None)
+            while not self.stop_flag.is_set():
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if msg.get("cmd") == "subscribe":
+                        if not subscribed:
+                            subscribed = True
+                            self.subscribers.append(conn)
+                        conn.sendall((json.dumps(self.snapshot()) + "\n").encode())
+                        continue
+                    reply = self.handle(msg)
+                    if not subscribed:
+                        conn.sendall((json.dumps(reply) + "\n").encode())
+        except OSError:
+            pass
+        finally:
+            if subscribed:
+                try:
+                    self.subscribers.remove(conn)
+                except ValueError:
+                    pass
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def run(self):
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *_: self.stop_flag.set())
+        threading.Thread(target=self.audio_loop, daemon=True).start()
+        threading.Thread(target=self.save_loop, daemon=True).start()
+        threading.Thread(target=self.flush_loop, daemon=True).start()
+        self.serve()
+        self.stop_flag.set()
+        try:
+            self.save()
+        except OSError:
+            pass
+
+
+# ------------------------------------------------------------------- client
+
+def connect(timeout=0.4):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect(SOCK_PATH)
+    return s
+
+
+def ensure_daemon():
+    try:
+        return connect()
+    except (OSError, socket.timeout):
+        pass
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "daemon"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        time.sleep(0.08)
+        try:
+            return connect()
+        except OSError:
+            continue
+    raise SystemExit("noisebox: daemon did not come up")
+
+
+def request(msg, spawn=True):
+    s = ensure_daemon() if spawn else connect()
+    try:
+        s.sendall((json.dumps(msg) + "\n").encode())
+        s.settimeout(2.0)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        return json.loads(buf.split(b"\n", 1)[0]) if buf.strip() else {}
+    finally:
+        s.close()
+
+
+def fmt_status(st):
+    if not st:
+        return "off"
+    head = f"{st['modeLabel']} {'▶' if st['playing'] else '■'}  vol {round(st['volume']*100)}%"
+    bits = "  ".join(f"{k} {round(v*100)}%" for k, v in st["params"].items())
+    if st.get("sleepRemaining"):
+        head += f"  sleep {st['sleepRemaining']//60}m"
+    return head + ("\n" + bits if bits else "")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="noisebox", description=__doc__.split("\n")[1])
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("daemon", help="run the synthesiser (foreground)")
+    sub.add_parser("on")
+    sub.add_parser("off")
+    sub.add_parser("toggle")
+    sub.add_parser("quit", help="shut the daemon down")
+    sub.add_parser("ensure", help="start the daemon if it is not already running")
+    p = sub.add_parser("mode", help="switch sound")
+    p.add_argument("name", choices=MODE_ORDER)
+    p.add_argument("--play", action="store_true")
+    p = sub.add_parser("set", help="set a parameter, 0..1 (or mode.param)")
+    p.add_argument("pairs", nargs="+", metavar="KEY=VALUE")
+    p = sub.add_parser("sleep", help="stop after N minutes (0 disables)")
+    p.add_argument("minutes", type=int)
+    p = sub.add_parser("cmd", help="forward a raw JSON message (used by the bar plugin)")
+    p.add_argument("json", metavar="JSON")
+    p = sub.add_parser("status")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("preview", help="render a wav instead of playing")
+    p.add_argument("name", choices=MODE_ORDER)
+    p.add_argument("--seconds", type=float, default=12.0)
+    p.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    if args.cmd == "daemon":
+        Daemon().run()
+        return
+
+    if args.cmd == "preview":
+        import wave
+        st = default_state()
+        st["mode"] = args.name
+        st["playing"] = True
+        st["volume"] = 0.8
+        eng = Engine()
+        eng.gain = 0.64
+        hops = int(args.seconds * RATE / HOP)
+        data = np.concatenate([eng.render(st) for _ in range(hops)])
+        out = args.out or f"/tmp/noisebox-{args.name}.wav"
+        pcm = np.clip(data, -1, 1)
+        with wave.open(out, "wb") as w:
+            w.setnchannels(CHANNELS)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes((pcm * 32767).astype("<i2").tobytes())
+        print(out)
+        return
+
+    if args.cmd == "ensure":
+        ensure_daemon().close()
+        return
+
+    if args.cmd == "cmd":
+        try:
+            msg = json.loads(args.json)
+        except ValueError:
+            raise SystemExit("noisebox: not valid JSON")
+        if not isinstance(msg, dict):
+            raise SystemExit("noisebox: expected a JSON object")
+        request(msg)
+        return
+
+    if args.cmd in ("on", "off", "toggle"):
+        print(fmt_status(request({"cmd": args.cmd})))
+    elif args.cmd == "quit":
+        try:
+            request({"cmd": "quit"}, spawn=False)
+        except OSError:
+            pass
+    elif args.cmd == "mode":
+        print(fmt_status(request({"cmd": "mode", "name": args.name, "play": args.play})))
+    elif args.cmd == "set":
+        params = {}
+        for pair in args.pairs:
+            if "=" not in pair:
+                raise SystemExit(f"noisebox: expected KEY=VALUE, got {pair!r}")
+            k, v = pair.split("=", 1)
+            params[k] = float(v)
+        print(fmt_status(request({"cmd": "set", "params": params})))
+    elif args.cmd == "sleep":
+        print(fmt_status(request({"cmd": "set", "params": {"sleep": args.minutes}})))
+    elif args.cmd == "status":
+        try:
+            st = request({"cmd": "status"}, spawn=False)
+        except OSError:
+            st = {}
+        print(json.dumps(st) if args.json else fmt_status(st))
+    else:
+        ap.print_help()
+
+
+if __name__ == "__main__":
+    main()

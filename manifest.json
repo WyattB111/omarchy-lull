@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "wyatt.noisebox",
+  "name": "Noisebox",
+  "version": "1.0.0",
+  "author": "Wyatt",
+  "license": "MIT",
+  "description": "Synthesised background noise — rain, ocean, wind, stream, fan and plain white/pink/brown — generated live from shaped noise, with sliders to dial each one in. No sample files.",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Noisebox",
+    "description": "Toggle and shape a synthesised ambience: rain, surf, wind, a stream, a fan, or plain coloured noise.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showLabel": false,
+      "showSleep": true,
+      "scrollVolume": true,
+      "volumeStep": 5
+    },
+    "schema": [
+      { "key": "showLabel", "type": "boolean", "label": "Show sound name", "defaultValue": false,
+        "description": "Print the active sound next to the icon. Off keeps it an icon-only pill." },
+      { "key": "showSleep", "type": "boolean", "label": "Show sleep countdown", "defaultValue": true,
+        "description": "While a sleep timer is armed, show the minutes left in the bar." },
+      { "key": "scrollVolume", "type": "boolean", "label": "Scroll to change volume", "defaultValue": true },
+      { "key": "volumeStep", "type": "integer", "label": "Scroll step (%)", "min": 1, "max": 20, "step": 1,
+        "defaultValue": 5 }
+    ]
+  }
+}
