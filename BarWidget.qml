@@ -4,7 +4,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// The Noisebox pill.
+// The Lull pill.
 //
 // Ambience is a background thing, so the widget is deliberately quiet: an icon
 // for the sound that is loaded, tinted only while it is actually running. The
@@ -15,9 +15,9 @@ import qs.Ui
 // to the next sound, scroll changes the volume.
 BarWidget {
   id: root
-  moduleName: "wyatt.noisebox"
+  moduleName: "wyatt.lull"
 
-  readonly property var noise: bar && bar.shell ? bar.shell.serviceFor("wyatt.noisebox") : null
+  readonly property var noise: bar && bar.shell ? bar.shell.serviceFor("wyatt.lull") : null
 
   readonly property bool showLabel:    setting("showLabel", false) === true
   readonly property bool showSleep:    setting("showSleep", true) === true
@@ -47,8 +47,8 @@ BarWidget {
 
   readonly property string tooltipText: {
     if (noise && noise.stalled)
-      return "Noisebox\n\nThe synthesiser will not start.\nInstall its dependency:  omarchy pkg add python-numpy"
-    if (!noise || !noise.ready) return "Noisebox"
+      return "Lull\n\nThe synthesiser will not start.\nInstall its dependency:  omarchy pkg add python-numpy"
+    if (!noise || !noise.ready) return "Lull"
     var lines = []
     lines.push(noise.modeLabel + (playing ? "  ·  playing" : "  ·  stopped"))
     lines.push("Volume " + Math.round(noise.volume * 100) + "%")
@@ -183,9 +183,9 @@ BarWidget {
     onExited:  if (root.bar) root.bar.hideTooltip(root)
   }
 
-  // Lets a keybind drive the widget: `omarchy-shell wyatt.noisebox <method>`
+  // Lets a keybind drive the widget: `omarchy-shell wyatt.lull <method>`
   IpcHandler {
-    target: "wyatt.noisebox"
+    target: "wyatt.lull"
 
     function toggle(): void  { if (root.noise) root.noise.toggle() }
     function next(): void    { if (root.noise) root.noise.cycleMode(1) }

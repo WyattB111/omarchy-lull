@@ -3,7 +3,7 @@ import Quickshell
 import qs.Commons
 import qs.Ui
 
-// The Noisebox mixer.
+// The Lull mixer.
 //
 // Ordered by how often you touch it: pick a sound, set how loud it is, then
 // shape it. The per-sound sliders are built from the schema the daemon
@@ -11,7 +11,7 @@ import qs.Ui
 // synthesiser makes it appear in this panel with no QML change.
 Panel {
   id: root
-  moduleName: "wyatt.noisebox"
+  moduleName: "wyatt.lull"
   ipcTarget: ""
   manageIpc: false
 
@@ -134,7 +134,7 @@ Panel {
           Text {
             width: parent.width
             elide: Text.ElideRight
-            text: root.noise ? root.noise.modeLabel : "Noisebox"
+            text: root.noise ? root.noise.modeLabel : "Lull"
             color: root.fg
             font.family: root.ff
             font.pixelSize: Style.font.body

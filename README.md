@@ -1,4 +1,4 @@
-# Noisebox
+# Lull
 
 Background noise for [Omarchy](https://omarchy.org/), generated live in the bar.
 Rain, ocean, wind, a stream, a fan, and plain white/pink/brown noise — each with
@@ -8,14 +8,14 @@ sliders to dial it in.
 plays, which is why the whole plugin is a few hundred kilobytes and why the
 sliders change the sound instantly instead of crossfading between loops.
 
-![The Noisebox mixer](preview.png)
+![The Lull mixer](preview.png)
 
 ## Install
 
 Review the repository, then add the plugin:
 
 ```bash
-omarchy plugin add https://github.com/WyattB111/omarchy-noisebox.git
+omarchy plugin add https://github.com/WyattB111/omarchy-lull.git
 ```
 
 Accept the prompt to enable the plugin during installation.
@@ -23,7 +23,7 @@ Accept the prompt to enable the plugin during installation.
 For an unattended install from a repository you already trust:
 
 ```bash
-omarchy plugin add https://github.com/WyattB111/omarchy-noisebox.git --enable --yes
+omarchy plugin add https://github.com/WyattB111/omarchy-lull.git --enable --yes
 ```
 
 ### Requirements
@@ -57,9 +57,9 @@ Keybindings stay user-owned. Add these to `~/.config/hypr/bindings.lua` if you
 want them:
 
 ```lua
-o.bind("SUPER + N",       "Noisebox mixer",       "omarchy-shell wyatt.noisebox mixer")
-o.bind("SUPER + ALT + N", "Noisebox: toggle",     "omarchy-shell wyatt.noisebox toggle")
-o.bind("SUPER + ALT + M", "Noisebox: next sound", "omarchy-shell wyatt.noisebox next")
+o.bind("SUPER + N",       "Lull mixer",       "omarchy-shell wyatt.lull mixer")
+o.bind("SUPER + ALT + N", "Lull: toggle",     "omarchy-shell wyatt.lull toggle")
+o.bind("SUPER + ALT + M", "Lull: next sound", "omarchy-shell wyatt.lull next")
 ```
 
 The IPC endpoints are `mixer`, `toggle`, `next`, `prev`, `louder`, `quieter`.
@@ -70,29 +70,29 @@ The bundled engine is also a CLI, and it shares state with the bar live in both
 directions:
 
 ```bash
-noisebox on|off|toggle
-noisebox mode ocean
-noisebox set volume=0.4 surf=0.8
-noisebox sleep 30
-noisebox status
+lull on|off|toggle
+lull mode ocean
+lull set volume=0.4 surf=0.8
+lull sleep 30
+lull status
 ```
 
-It lives at `~/.config/omarchy/plugins/wyatt.noisebox/bin/noisebox`. Symlink it
+It lives at `~/.config/omarchy/plugins/wyatt.lull/bin/lull`. Symlink it
 onto your `PATH` if you want the short command:
 
 ```bash
-ln -s ~/.config/omarchy/plugins/wyatt.noisebox/bin/noisebox ~/.local/bin/noisebox
+ln -s ~/.config/omarchy/plugins/wyatt.lull/bin/lull ~/.local/bin/lull
 ```
 
 ## What it does on your system
 
-- **Runs a background process.** `bin/noisebox daemon`, started on demand and
+- **Runs a background process.** `bin/lull daemon`, started on demand and
   exiting with your session. It holds the audio stream so sound survives a shell
   reload. Idle when stopped; roughly 1.5% of one core and ~40 MB while playing.
 - **Executes** `pw-cat` (or `paplay`) to play audio, and `python3` to run itself.
-- **Writes** `~/.config/noisebox/config.json` — your slider positions. Nothing
+- **Writes** `~/.config/lull/config.json` — your slider positions. Nothing
   else on disk is touched.
-- **Listens** on a unix socket at `$XDG_RUNTIME_DIR/noisebox.sock`, used by the
+- **Listens** on a unix socket at `$XDG_RUNTIME_DIR/lull.sock`, used by the
   bar widget and the CLI. It is not a network socket.
 - **No network access at all.**
 - **Never starts playing on its own.** Playback state is deliberately not
@@ -115,13 +115,13 @@ turns hiss into rain.
 ## Update
 
 ```bash
-omarchy plugin update wyatt.noisebox
+omarchy plugin update wyatt.lull
 ```
 
 ## Remove
 
 ```bash
-omarchy plugin remove wyatt.noisebox
+omarchy plugin remove wyatt.lull
 ```
 
 That stops the widget and deletes the plugin. Your saved slider positions and
@@ -129,8 +129,8 @@ the optional symlink are left behind deliberately; remove them yourself if you
 want nothing left:
 
 ```bash
-rm -rf ~/.config/noisebox
-rm -f ~/.local/bin/noisebox
+rm -rf ~/.config/lull
+rm -f ~/.local/bin/lull
 ```
 
 Any keybindings you added to `~/.config/hypr/bindings.lua` are yours to delete —

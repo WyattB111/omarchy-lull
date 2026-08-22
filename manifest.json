@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
-  "id": "wyatt.noisebox",
-  "name": "Noisebox",
+  "id": "wyatt.lull",
+  "name": "Lull",
   "version": "1.0.0",
   "author": "Wyatt",
   "license": "MIT",
@@ -12,7 +12,7 @@
     "barWidget": "BarWidget.qml"
   },
   "barWidget": {
-    "displayName": "Noisebox",
+    "displayName": "Lull",
     "description": "Toggle and shape a synthesised ambience: rain, surf, wind, a stream, a fan, or plain coloured noise.",
     "category": "Media",
     "allowMultiple": false,

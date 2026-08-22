@@ -2,9 +2,9 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 
-// Headless singleton behind the Noisebox plugin.
+// Headless singleton behind the Lull plugin.
 //
-// The synthesiser is a separate long-running process (`noisebox daemon`) that
+// The synthesiser is a separate long-running process (`lull daemon`) that
 // owns the audio stream, so sound survives a shell reload and there is exactly
 // one generator no matter how many monitors mount a widget.
 //
@@ -12,7 +12,7 @@ import Quickshell.Io
 // shelling out per action, because the panel's sliders emit on every frame of
 // a drag: a socket write is a few dozen bytes, a process spawn is milliseconds
 // and a scheduler round trip. The daemon pushes state back on the same
-// connection, so the bar stays in sync with `noisebox` used from a terminal.
+// connection, so the bar stays in sync with `lull` used from a terminal.
 Item {
   id: root
 
@@ -30,8 +30,8 @@ Item {
   readonly property string sourceDir: manifest && manifest.__sourceDir
     ? String(manifest.__sourceDir) : ""
   readonly property string bin: sourceDir
-    ? sourceDir + "/bin/noisebox"
-    : localPath(Qt.resolvedUrl("bin/noisebox"))
+    ? sourceDir + "/bin/lull"
+    : localPath(Qt.resolvedUrl("bin/lull"))
 
   function localPath(url) {
     var value = String(url || "")
@@ -44,7 +44,7 @@ Item {
   }
   readonly property string sockPath: {
     var dir = Quickshell.env("XDG_RUNTIME_DIR")
-    return (dir && dir !== "" ? dir : "/tmp") + "/noisebox.sock"
+    return (dir && dir !== "" ? dir : "/tmp") + "/lull.sock"
   }
 
   // ---------------------------------------------------------------------------
