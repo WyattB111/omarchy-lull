@@ -47,7 +47,7 @@ BarWidget {
 
   readonly property string tooltipText: {
     if (noise && noise.stalled)
-      return "Lull\n\nThe synthesiser will not start.\nInstall its dependency:  omarchy pkg add python-numpy"
+      return "Lull\n\nThe synthesiser will not start.\nIt needs the python-numpy package."
     if (!noise || !noise.ready) return "Lull"
     var lines = []
     lines.push(noise.modeLabel + (playing ? "  ·  playing" : "  ·  stopped"))

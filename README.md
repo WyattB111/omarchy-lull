@@ -28,10 +28,9 @@ omarchy plugin add https://github.com/WyattB111/omarchy-lull.git --enable --yes
 
 ### Requirements
 
-- **`python-numpy`** — the synthesiser needs it and will not start without it:
-  ```bash
-  omarchy pkg add python-numpy
-  ```
+- **`python-numpy`** — the synthesiser will not start without it. Install the
+  `python-numpy` package before enabling the plugin. (Lull never installs
+  anything itself; it only tells you when the package is missing.)
 - **PipeWire** (`pw-cat`), which Omarchy already ships. `paplay` is used as a
   fallback if `pw-cat` is missing.
 
