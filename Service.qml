@@ -54,6 +54,12 @@ Item {
   property var view: ({})
   property bool ready: false
 
+  // Counts connection attempts that produced nothing. The engine's one external
+  // dependency is numpy; without it the daemon exits immediately and the widget
+  // would otherwise sit at "starting…" forever with no hint as to why.
+  property int attempts: 0
+  readonly property bool stalled: !ready && attempts >= 6
+
   readonly property bool   playing:        view.playing === true
   readonly property string mode:           view.mode || "rain"
   readonly property string modeLabel:      view.modeLabel || "Rain"
@@ -69,9 +75,16 @@ Item {
     return (v === undefined || v === null || isNaN(Number(v))) ? fallback : Number(v)
   }
 
+  // Falls back to a local table rather than the raw id, so the sound buttons
+  // still read as names during the moments before the daemon answers.
+  readonly property var fallbackLabels: ({
+    "rain": "Rain", "ocean": "Ocean", "wind": "Wind",
+    "stream": "Stream", "fan": "Fan", "noise": "Noise"
+  })
+
   function labelFor(name) {
     var m = view.labels || {}
-    return m[name] || name
+    return m[name] || fallbackLabels[name] || name
   }
 
   // [{key, label}] for the sliders a given sound exposes.
@@ -137,6 +150,7 @@ Item {
     try {
       root.view = JSON.parse(raw)
       root.ready = true
+      root.attempts = 0
     } catch (e) {
       // A partial frame is not worth surfacing; the next push is whole.
     }
@@ -152,6 +166,7 @@ Item {
     triggeredOnStart: true
     onTriggered: {
       if (!ensureProc.running) ensureProc.running = true
+      root.attempts += 1
       sockLoader.active = false
       sockLoader.active = true
     }

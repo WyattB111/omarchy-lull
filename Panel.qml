@@ -101,46 +101,60 @@ Panel {
       spacing: Style.space(10)
 
       // ------------------------------------------------------------- header
+      //
+      // Anchored rather than a Row so the status line has a real width to work
+      // with: the "install python-numpy" message is far longer than "stopped"
+      // and has to wrap inside the space left by the transport button instead
+      // of sliding underneath it.
       Item {
         width: parent.width
-        implicitHeight: Math.max(titleRow.implicitHeight, transport.implicitHeight)
+        implicitHeight: Math.max(headGlyph.implicitHeight,
+                                 headText.implicitHeight,
+                                 transport.implicitHeight)
 
-        Row {
-          id: titleRow
+        Text {
+          id: headGlyph
           anchors.left: parent.left
           anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(8)
+          text: root.noise ? root.noise.glyphFor(root.noise.mode) : "󰝚"
+          color: root.noise && root.noise.playing ? Color.accent : root.dim(0.8)
+          font.family: root.ff
+          font.pixelSize: Style.font.icon
+        }
+
+        Column {
+          id: headText
+          anchors.left: headGlyph.right
+          anchors.leftMargin: Style.space(8)
+          anchors.right: transport.left
+          anchors.rightMargin: Style.space(10)
+          anchors.verticalCenter: parent.verticalCenter
+          spacing: Style.space(1)
 
           Text {
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.noise ? root.noise.glyphFor(root.noise.mode) : "󰝚"
-            color: root.noise && root.noise.playing ? Color.accent : root.dim(0.8)
+            width: parent.width
+            elide: Text.ElideRight
+            text: root.noise ? root.noise.modeLabel : "Noisebox"
+            color: root.fg
             font.family: root.ff
-            font.pixelSize: Style.font.icon
+            font.pixelSize: Style.font.body
+            font.bold: true
           }
 
-          Column {
-            anchors.verticalCenter: parent.verticalCenter
-            spacing: Style.space(1)
-
-            Text {
-              text: root.noise ? root.noise.modeLabel : "Noisebox"
-              color: root.fg
-              font.family: root.ff
-              font.pixelSize: Style.font.body
-              font.bold: true
-            }
-            Text {
-              text: !root.live ? "starting the synthesiser…"
-                   : root.noise.playing
-                     ? (root.noise.sleepRemaining > 0
-                        ? "playing · stops in " + Math.ceil(root.noise.sleepRemaining / 60) + " min"
-                        : "playing")
-                     : "stopped"
-              color: root.dim(0.5)
-              font.family: root.ff
-              font.pixelSize: Style.font.caption
-            }
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: root.noise && root.noise.stalled
+                   ? "synthesiser will not start — install python-numpy"
+                 : !root.live ? "starting the synthesiser…"
+                 : root.noise.playing
+                   ? (root.noise.sleepRemaining > 0
+                      ? "playing · stops in " + Math.ceil(root.noise.sleepRemaining / 60) + " min"
+                      : "playing")
+                   : "stopped"
+            color: root.noise && root.noise.stalled ? Color.urgent : root.dim(0.5)
+            font.family: root.ff
+            font.pixelSize: Style.font.caption
           }
         }
 
