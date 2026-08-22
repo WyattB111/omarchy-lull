@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "wyatt.lull",
   "name": "Lull",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Wyatt",
   "license": "MIT",
   "description": "Synthesised background noise — rain, ocean, wind, stream, fan and plain white/pink/brown — generated live from shaped noise, with sliders to dial each one in. No sample files.",

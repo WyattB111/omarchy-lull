@@ -178,6 +178,19 @@ Item {
     running: false
   }
 
+  // A subscription is read-only once established, so without this the daemon's
+  // idle deadline would reap the bar's connection every five minutes. Ping well
+  // inside that window; the daemon treats it as a no-op and does not broadcast.
+  Timer {
+    interval: 120000
+    running: root.ready
+    repeat: true
+    onTriggered: {
+      var live = sockLoader.item
+      if (live && live.connected) live.write('{"cmd":"ping"}\n')
+    }
+  }
+
   // The countdown is pushed only when something else changes, so tick it
   // locally to keep the bar's sleep timer honest between updates.
   Timer {

@@ -30,6 +30,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -41,6 +42,17 @@ RATE = 48000
 FRAME = 2048                 # spectral frame length
 HOP = FRAME // 2             # 1024 samples ≈ 21.3 ms
 CHANNELS = 2
+
+# Resource limits on the control socket. This process is long-lived and any
+# process running as this user can connect to it, so every input path needs a
+# ceiling: a control frame is a few hundred bytes and the largest reply — a
+# full state snapshot — is under 2 KB, so these are generous by ~10x.
+MAX_FRAME = 16 * 1024          # bytes buffered for one newline-terminated frame
+MAX_CLIENTS = 8                # concurrent connections, and therefore threads
+IDLE_TIMEOUT = 300.0           # seconds a connection may sit without sending
+MAX_LIFETIME = 24 * 3600.0     # hard ceiling on any one connection
+KEEPALIVE = 120.0              # subscribers ping at this interval to stay under IDLE_TIMEOUT
+MAX_CONFIG_BYTES = 256 * 1024  # refuse to parse a config larger than this
 
 CONFIG_DIR = os.path.expanduser("~/.config/lull")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
@@ -149,6 +161,14 @@ def lerp(a, b, t):
 def logmap(t, lo, hi):
     t = min(1.0, max(0.0, float(t)))
     return lo * (hi / lo) ** t
+
+
+def clamp_minutes(v):
+    """Sleep timer minutes, coerced from whatever arrived on the wire."""
+    try:
+        return max(0, min(600, int(v or 0)))
+    except (TypeError, ValueError):
+        return 0
 
 
 def clamp01(v):
@@ -405,27 +425,45 @@ class Daemon:
         self.idle_since = time.time()
         self._last_bcast = 0.0
         self._pending_bcast = False
+        self.client_lock = threading.Lock()
+        self.client_count = 0
 
     # -- persistence -----------------------------------------------------
 
     def load(self):
+        """Read saved settings defensively.
+
+        The config is an ordinary user-writable file, so it is untrusted input
+        like anything else: cap what will be parsed, and check the type at
+        every level rather than assuming a dict of dicts of numbers.
+        """
         st = default_state()
         try:
+            if os.path.getsize(CONFIG_PATH) > MAX_CONFIG_BYTES:
+                return st
             with open(CONFIG_PATH) as fh:
                 saved = json.load(fh)
         except (OSError, ValueError):
             return st
+        if not isinstance(saved, dict):
+            return st
+
         for k, _, _ in GLOBAL_PARAMS:
             if k in saved:
                 st[k] = clamp01(saved[k])
         if saved.get("mode") in MODE_ORDER:
             st["mode"] = saved["mode"]
-        st["sleep_minutes"] = max(0, int(saved.get("sleep_minutes", 0) or 0))
-        for m, params in st["modes"].items():
-            for k in params:
-                v = saved.get("modes", {}).get(m, {}).get(k)
-                if v is not None:
-                    params[k] = clamp01(v)
+        st["sleep_minutes"] = clamp_minutes(saved.get("sleep_minutes", 0))
+
+        saved_modes = saved.get("modes")
+        if isinstance(saved_modes, dict):
+            for m, params in st["modes"].items():
+                block = saved_modes.get(m)
+                if not isinstance(block, dict):
+                    continue
+                for k in params:
+                    if k in block:
+                        params[k] = clamp01(block[k])
         # Playing is deliberately not restored; a reboot should be silent.
         return st
 
@@ -435,11 +473,21 @@ class Daemon:
             snap["mode"] = self.state["mode"]
             snap["sleep_minutes"] = self.state["sleep_minutes"]
             snap["modes"] = json.loads(json.dumps(self.state["modes"]))
-        os.makedirs(CONFIG_DIR, exist_ok=True)
-        tmp = CONFIG_PATH + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(snap, fh, indent=2)
-        os.replace(tmp, CONFIG_PATH)
+        os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
+        # mkstemp opens with O_CREAT|O_EXCL at mode 0600 and an unpredictable
+        # name, so a symlink pre-planted at a fixed ".tmp" path cannot redirect
+        # this write and truncate a file elsewhere.
+        fd, tmp = tempfile.mkstemp(dir=CONFIG_DIR, prefix=".config-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(snap, fh, indent=2)
+            os.replace(tmp, CONFIG_PATH)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
     # -- public view -----------------------------------------------------
 
@@ -495,14 +543,17 @@ class Daemon:
         with self.lock:
             st = self.state
             if cmd == "set":
-                for k, v in (msg.get("params") or {}).items():
+                params = msg.get("params")
+                if not isinstance(params, dict):
+                    params = {}
+                for k, v in params.items():
                     if k in ("volume", "muffle", "width"):
                         st[k] = clamp01(v)
                     elif k == "mode":
                         if v in MODE_ORDER:
                             st["mode"] = v
                     elif k == "sleep":
-                        st["sleep_minutes"] = max(0, min(600, int(v or 0)))
+                        st["sleep_minutes"] = clamp_minutes(v)
                         self.arm_sleep()
                     elif k in st["modes"][st["mode"]]:
                         st["modes"][st["mode"]][k] = clamp01(v)
@@ -530,7 +581,13 @@ class Daemon:
                         self.arm_sleep()
                     self.dirty = True
             elif cmd == "nudge":
-                st["volume"] = clamp01(st["volume"] + float(msg.get("by", 0.05)))
+                try:
+                    by = float(msg.get("by", 0.05))
+                except (TypeError, ValueError):
+                    by = 0.0
+                if by != by or by in (float("inf"), float("-inf")):
+                    by = 0.0
+                st["volume"] = clamp01(st["volume"] + by)
                 self.dirty = True
             elif cmd == "quit":
                 self.stop_flag.set()
@@ -640,7 +697,12 @@ class Daemon:
             pass
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(SOCK_PATH)
-        srv.listen(16)
+        # The runtime dir is already private, but the socket says so too.
+        try:
+            os.chmod(SOCK_PATH, 0o600)
+        except OSError:
+            pass
+        srv.listen(MAX_CLIENTS)
         srv.settimeout(0.5)
         while not self.stop_flag.is_set():
             try:
@@ -649,6 +711,16 @@ class Daemon:
                 continue
             except OSError:
                 break
+            # Refuse rather than queue: an unbounded accept loop is an
+            # unbounded thread and buffer count in a process that never exits.
+            with self.client_lock:
+                if self.client_count >= MAX_CLIENTS:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    continue
+                self.client_count += 1
             threading.Thread(target=self.client, args=(conn,), daemon=True).start()
         srv.close()
         try:
@@ -657,24 +729,52 @@ class Daemon:
             pass
 
     def client(self, conn):
-        buf = b""
+        """Serve one connection under a frame, idle, and lifetime ceiling.
+
+        Every limit here exists because this daemon outlives every client and
+        runs unsandboxed: an unbounded frame buffer, an unbounded connection
+        lifetime, and a disabled socket timeout each let one misbehaving
+        same-user process grow this process without bound.
+        """
+        buf = bytearray()
         subscribed = False
+        expires = time.monotonic() + MAX_LIFETIME
         try:
-            conn.settimeout(None)
+            conn.settimeout(IDLE_TIMEOUT)
             while not self.stop_flag.is_set():
-                chunk = conn.recv(4096)
+                if time.monotonic() >= expires:
+                    break
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    break
                 if not chunk:
                     break
+                # Cap before appending, so an endless line without a newline
+                # cannot grow the buffer past one frame.
+                if len(buf) + len(chunk) > MAX_FRAME:
+                    break
                 buf += chunk
-                while b"\n" in buf:
-                    line, buf = buf.split(b"\n", 1)
+
+                idx = buf.find(b"\n")
+                while idx != -1:
+                    line = bytes(buf[:idx])
+                    del buf[:idx + 1]
+                    idx = buf.find(b"\n")
                     if not line.strip():
                         continue
                     try:
                         msg = json.loads(line)
                     except ValueError:
                         continue
-                    if msg.get("cmd") == "subscribe":
+                    # Shape-check before anything reads a field off it.
+                    if not isinstance(msg, dict):
+                        continue
+
+                    cmd = msg.get("cmd")
+                    if cmd == "ping":
+                        continue
+                    if cmd == "subscribe":
                         if not subscribed:
                             subscribed = True
                             self.subscribers.append(conn)
@@ -695,6 +795,8 @@ class Daemon:
                 conn.close()
             except OSError:
                 pass
+            with self.client_lock:
+                self.client_count = max(0, self.client_count - 1)
 
     def run(self):
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -748,7 +850,15 @@ def request(msg, spawn=True):
             if not chunk:
                 break
             buf += chunk
-        return json.loads(buf.split(b"\n", 1)[0]) if buf.strip() else {}
+            if len(buf) > MAX_FRAME:
+                return {}
+        if not buf.strip():
+            return {}
+        try:
+            reply = json.loads(buf.split(b"\n", 1)[0])
+        except ValueError:
+            return {}
+        return reply if isinstance(reply, dict) else {}
     finally:
         s.close()
 
