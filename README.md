@@ -15,7 +15,7 @@ sliders change the sound instantly instead of crossfading between loops.
 Review the repository, then add the plugin:
 
 ```bash
-omarchy plugin add https://github.com/YOUR-GITHUB-USERNAME/omarchy-noisebox.git
+omarchy plugin add https://github.com/WyattB111/omarchy-noisebox.git
 ```
 
 Accept the prompt to enable the plugin during installation.
@@ -23,7 +23,7 @@ Accept the prompt to enable the plugin during installation.
 For an unattended install from a repository you already trust:
 
 ```bash
-omarchy plugin add https://github.com/YOUR-GITHUB-USERNAME/omarchy-noisebox.git --enable --yes
+omarchy plugin add https://github.com/WyattB111/omarchy-noisebox.git --enable --yes
 ```
 
 ### Requirements
