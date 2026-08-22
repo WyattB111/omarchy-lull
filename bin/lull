@@ -28,6 +28,7 @@ import math
 import os
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -430,20 +431,63 @@ class Daemon:
 
     # -- persistence -----------------------------------------------------
 
+    @staticmethod
+    def read_config_bytes():
+        """Read the config through a single no-follow descriptor, or None.
+
+        Sizing the file by path and then reopening it by path asks two
+        questions about two possibly-different inodes: the file can be replaced
+        or grown in between, so the size that was checked need not be the size
+        that gets parsed. A plain open() would also follow a symlink planted at
+        the config path, and json.load on the result would be unbounded again.
+
+        So: open once with O_NOFOLLOW, confirm from fstat on that same
+        descriptor that it is a regular file, and read at most the ceiling plus
+        one byte from it. The extra byte is what detects an oversized file —
+        the read itself decides, rather than a size observed separately.
+        """
+        # O_NONBLOCK matters as much as O_NOFOLLOW here: opening a FIFO
+        # read-only blocks until a writer appears, which would hang the daemon
+        # at startup before fstat ever got the chance to reject it. On a
+        # regular file the flag changes nothing.
+        flags = (os.O_RDONLY
+                 | getattr(os, "O_NOFOLLOW", 0)
+                 | getattr(os, "O_NONBLOCK", 0)
+                 | getattr(os, "O_CLOEXEC", 0))
+        try:
+            fd = os.open(CONFIG_PATH, flags)
+        except OSError:
+            return None
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            want = MAX_CONFIG_BYTES + 1
+            data = b""
+            while len(data) < want:
+                chunk = os.read(fd, want - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            return None if len(data) > MAX_CONFIG_BYTES else data
+        except OSError:
+            return None
+        finally:
+            os.close(fd)
+
     def load(self):
         """Read saved settings defensively.
 
         The config is an ordinary user-writable file, so it is untrusted input
-        like anything else: cap what will be parsed, and check the type at
+        like anything else: bound what will be parsed, and check the type at
         every level rather than assuming a dict of dicts of numbers.
         """
         st = default_state()
+        raw = self.read_config_bytes()
+        if raw is None:
+            return st
         try:
-            if os.path.getsize(CONFIG_PATH) > MAX_CONFIG_BYTES:
-                return st
-            with open(CONFIG_PATH) as fh:
-                saved = json.load(fh)
-        except (OSError, ValueError):
+            saved = json.loads(raw)
+        except ValueError:
             return st
         if not isinstance(saved, dict):
             return st
